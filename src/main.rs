@@ -1,5 +1,6 @@
-use std::io::{self, Read, Write};
-use std::process::{Command, Stdio, exit};
+use std::process::{Stdio, exit};
+
+use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, process::Command};
 
 // Define a function to compare two pixels
 fn pixel_compare(a: &(u8, u8, u8), b: &(u8, u8, u8)) -> std::cmp::Ordering {
@@ -29,13 +30,6 @@ fn sort_pixels_by_luminance(frame: &[u8], width: usize, height: usize) -> Option
         frame2d[i].sort_by(pixel_compare);
     }
 
-    // let final_frame = frame2d
-    // .concat()
-    // .iter()
-    // .cloned()
-    // .flat_map(|(a, b, c)| vec![a, b, c])
-    // .collect();
-
     let mut final_frame = Vec::new();
 
     for y in 0..height {
@@ -55,7 +49,7 @@ fn sort_pixels_by_luminance(frame: &[u8], width: usize, height: usize) -> Option
     Some(final_frame)
 }
 
-fn get_resolution() -> (usize, usize) {
+async fn get_resolution() -> (usize, usize) {
     let output = Command::new("ffprobe")
         .arg("-v")
         .arg("error")
@@ -67,7 +61,7 @@ fn get_resolution() -> (usize, usize) {
         .arg("default=noprint_wrappers=1")
         .arg("clip.mkv")
         .output()
-        .expect("failed to execute ffprobe command");
+        .await.expect("failed to execute ffprobe command");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -95,7 +89,7 @@ fn get_resolution() -> (usize, usize) {
     (width.unwrap(), height.unwrap())
 }
 
-fn process_video(width: usize, height: usize) -> io::Result<()> {
+async fn process_video(width: usize, height: usize) -> io::Result<()> {
     let mut ffmpeg = Command::new("ffmpeg")
     .args(&[
         "-i", "clip.mkv",
@@ -108,55 +102,57 @@ fn process_video(width: usize, height: usize) -> io::Result<()> {
     .stderr(Stdio::null())
     .spawn()?;
 
-let mut ffmpeg2 = Command::new("ffmpeg")
-    .args(&[
-        "-f", "rawvideo",
-        "-s:v", &format!("{}x{}", width, height),
-        "-pix_fmt", "rgb24",
-        "-r", "24",
-        "-i", "pipe:",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "22",
-        "-y", "output2.mp4",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()?;
+    let mut ffmpeg2 = Command::new("ffmpeg")
+        .args(&[
+            "-f", "rawvideo",
+            "-s:v", &format!("{}x{}", width, height),
+            "-pix_fmt", "rgb24",
+            "-r", "24",
+            "-i", "pipe:",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "22",
+            "-y", "output2.mp4",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
 
-let ffmpeg_stdin = ffmpeg2.stdin.as_mut().unwrap();
-let mut buf = vec![0; width * height * 3];
-loop {
-    match ffmpeg.stdout.as_mut().unwrap().read_exact(&mut buf) {
-        Ok(_) => {
-            //let gray_frame = grayscale_frame(&buf, width, height);
-            
-            if let Some(sorted_frame) = sort_pixels_by_luminance(&buf, width, height){
-                ffmpeg_stdin.write_all(&sorted_frame)?;
+    let ffmpeg_stdin = ffmpeg2.stdin.as_mut().unwrap();
+    let mut buf = vec![0; width * height * 3];
+    let mut frame_n = 0;
+    loop {
+        match ffmpeg.stdout.as_mut().unwrap().read_exact(&mut buf).await {
+            Ok(_) => {
+                frame_n += 1;
+                println!("processing frame #{}", frame_n);
+                if let Some(sorted_frame) = sort_pixels_by_luminance(&buf, width, height) {
+                    ffmpeg_stdin.write_all(&sorted_frame).await?;
+                }
             }
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
         }
-        Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-        Err(e) => return Err(e),
     }
+
+    let ffmpeg_status = ffmpeg.wait().await?;
+    let ffmpeg2_status = ffmpeg2.wait().await?;
+
+    if !ffmpeg_status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "FFmpeg exited with error"));
+    }
+    if !ffmpeg2_status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "FFmpeg 2 exited with error"));
+    }
+
+    Ok(())
 }
 
-let ffmpeg_status = ffmpeg.wait()?;
-let ffmpeg2_status = ffmpeg2.wait()?;
-
-if !ffmpeg_status.success() {
-    return Err(io::Error::new(io::ErrorKind::Other, "FFmpeg exited with error"));
-}
-if !ffmpeg2_status.success() {
-    return Err(io::Error::new(io::ErrorKind::Other, "FFmpeg 2 exited with error"));
-}
-
-Ok(())
-}
-
-fn main() -> io::Result<()> {
-    let (width, height) = get_resolution();
-    let status = process_video(width, height);
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let (width, height) = get_resolution().await;
+    let status = process_video(width, height).await;
 
     if status.is_err() {
         return status
