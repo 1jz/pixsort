@@ -1,7 +1,8 @@
-use std::{process::{Stdio, exit }, sync::{atomic::{AtomicBool, Ordering, AtomicU16}, Arc}, io::Write};
+use std::{process::{Stdio, exit }, sync::{atomic::{AtomicBool, Ordering, AtomicU16}, Arc}, io::Write, time::Duration};
 use ctrlc;
-use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, process::Command, task::{JoinHandle}};
+use tokio::{io::{self, AsyncWriteExt, AsyncReadExt}, process::Command, task::JoinHandle, time::sleep};
 use crossbeam::channel::{bounded, Receiver, Sender};
+use clap::Parser;
 
 fn pixel_compare(a: &(u8, u8, u8), b: &(u8, u8, u8)) -> std::cmp::Ordering {
     // Compute the brightness of each pixel as the sum of the RGB components
@@ -10,22 +11,73 @@ fn pixel_compare(a: &(u8, u8, u8), b: &(u8, u8, u8)) -> std::cmp::Ordering {
     brightness_a.cmp(&brightness_b)
 }
 
-fn sort_pixels_by_luminance(frame: Vec<u8>, width: usize, height: usize) -> Vec<u8> {
-    let mut frame2d = Vec::new();
-    for x in 0..width {
-        let mut col = Vec::new();
-        for y in 0..height {
-            let i = (y * width + x) * 3;
-            let r = frame[i];
-            let g = frame[i + 1];
-            let b = frame[i + 2];
-            col.push((r, g, b));
-        }
-        frame2d.push(col);
-    }
+fn convert_to_2d_tuples(input: Vec<u8>, width: usize, height: usize) -> Vec<Vec<(u8, u8, u8)>> {
+    (0..width)
+        .map(|x| {
+            (0..height)
+                .map(|y| {
+                    let index = (y * width + x) * 3;
+                    (input[index], input[index + 1], input[index + 2])
+                })
+                .collect()
+        })
+        .collect()
+}
 
-    for i in 0..frame2d.len() {
-        frame2d[i].sort_by(pixel_compare);
+fn sort_pixels_by_luminance(
+    frame: Vec<u8>,
+    width: usize,
+    height: usize,
+    threshold: (u8, u8),
+) -> Vec<u8> {
+
+    // horizontal
+    // let mut frame2d = frame
+    //     .chunks_exact(3)
+    //     .map(|chunk| (chunk[0], chunk[1], chunk[2]))
+    //     .collect::<Vec<(u8, u8, u8)>>()
+    //     .chunks(width)
+    //     .map(|chunk| chunk.to_vec())
+    //     .collect::<Vec<Vec<(u8, u8, u8)>>>();
+
+    //     for i in 0..height {
+    //         frame2d[i].sort_by(pixel_compare);
+    //     }
+
+    // let final_frame = frame2d.into_iter().flat_map(|row| row.into_iter().flat_map(|(r, g, b)| vec![r, g, b])).collect();
+
+    // vertical
+    let mut frame2d = convert_to_2d_tuples(frame, width, height);
+
+    let black_threshold = threshold.0;
+    let white_threshold = threshold.1;
+
+    for i in 0..width {
+        let mut index = 0;
+        let mut in_segment = false;
+        for j in 0..height {
+            let pixel = frame2d[i][j];
+            let luminance = ((pixel.0 as u32  + pixel.1 as u32 + pixel.2 as u32) / 3) as u8;
+
+            if luminance >= black_threshold && luminance <= white_threshold {
+                if !in_segment {
+                    in_segment = true;
+                    index = j;
+                } 
+            } else if in_segment {
+                // End of the segment
+                in_segment = false;
+                let chunk = &mut frame2d[i][index..j];
+                chunk.sort_by(pixel_compare);
+                index = j;
+            }
+        }
+
+        if in_segment {
+            let chunk = &mut frame2d[i][index..height];
+            chunk.sort_by(pixel_compare);
+        }
+        // frame2d[i].sort_by(pixel_compare);
     }
 
     let mut final_frame = Vec::new();
@@ -38,7 +90,6 @@ fn sort_pixels_by_luminance(frame: Vec<u8>, width: usize, height: usize) -> Vec<
             final_frame.push(pixel.2);
         }
     }
-
     final_frame
 }
 
@@ -125,17 +176,33 @@ fn create_ffmpeg_input(file_path: &str) -> Result<tokio::process::Child, io::Err
     command
 }
 
-fn create_ffmpeg_output(width: usize, height: usize, file_path: &str) -> Result<tokio::process::Child, io::Error> {
+fn create_ffmpeg_video_output(width: usize, height: usize, rate: u16, file_path: &str) -> Result<tokio::process::Child, io::Error> {
     let command = Command::new("ffmpeg")
     .args(&[
         "-f", "rawvideo",
         "-s:v", &format!("{}x{}", width, height),
         "-pix_fmt", "rgb24",
-        "-r", "60",
+        "-r", &format!("{}", rate),
         "-i", "pipe:",
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "22",
+        "-y", file_path,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn();
+    command
+}
+
+fn create_ffmpeg_image_output(width: usize, height: usize, file_path: &str) -> Result<tokio::process::Child, io::Error> {
+    let command = Command::new("ffmpeg")
+    .args(&[
+        "-f", "rawvideo",
+        "-s:v", &format!("{}x{}", width, height),
+        "-pix_fmt", "rgb24",
+        "-i", "pipe:",
         "-y", file_path,
     ])
     .stdin(Stdio::piped())
@@ -179,10 +246,11 @@ async fn frame_sorting_worker(
     height: usize,
     process: Arc<AtomicBool>,
     sorted_frames: Arc<AtomicU16>,
+    threshold: (u8, u8),
 ) {
     while process.load(Ordering::SeqCst) {
         if let Ok(frame) = consumer_rx.recv() {
-            let sorted_frame = sort_pixels_by_luminance(frame.1, width, height);
+            let sorted_frame = sort_pixels_by_luminance(frame.1, width, height, threshold);
             while sorted_frames.load(Ordering::SeqCst) != frame.0 as u16 && process.load(Ordering::SeqCst) {}
             if let Ok(_res) = sorter_tx.send((frame.0, sorted_frame)) {
                 // println!("[{}]: {}", id, frame.0);
@@ -199,9 +267,15 @@ async fn frame_encoding_worker(
     process: Arc<AtomicBool>,
     sorted_frames: Arc<AtomicU16>,
     frame_count: u16,
+    rate: u16,
     tasks: Vec<JoinHandle<()>>,
 ) -> io::Result<()>  {
-    let mut ffmpeg = create_ffmpeg_output(width, height, output_path)?;
+    let mut ffmpeg;
+    if frame_count == 1 || output_path.ends_with(".gif") {
+        ffmpeg = create_ffmpeg_image_output(width, height, output_path)?;
+    } else {
+        ffmpeg = create_ffmpeg_video_output(width, height, rate, output_path)?;
+    }
     let ffmpeg_stdin = ffmpeg.stdin.as_mut().unwrap();
     while sorted_frames.load(Ordering::SeqCst) < frame_count && process.load(Ordering::SeqCst) {
         if !sorter_rx.is_empty() {
@@ -224,22 +298,21 @@ async fn frame_encoding_worker(
 }
 
 async fn process_video(
-    file_path: &str, 
-    output_path: &str, 
     width: usize, 
     height: usize, 
-    frame_count: u16
+    frame_count: u16,
+    args: Args
 ) -> io::Result<()> {
     let process = Arc::new(AtomicBool::new(true));
     let p = process.clone();
-    let num_workers = 14;
+    let num_workers = if args.threads < 3 {1} else { args.threads - 2 };
     println!("Starting {} workers...", num_workers);
 
     let (producer_tx, consumer_rx) = bounded(1); // Adjust buffer size as needed
     let (sorter_tx, sorter_rx) = bounded(num_workers);
 
     let ep = process.clone();
-    let fp: String = String::from(file_path);
+    let fp: String = String::from(args.input);
     let extractor = tokio::spawn(async move {
         let res = frame_extracting_worker(producer_tx, &fp, width, height, ep).await;
         if res.is_err() {
@@ -256,16 +329,16 @@ async fn process_video(
 
         let sp = process.clone();
         let st = tokio::spawn(async move {
-            frame_sorting_worker(i, consumer_rx, sorter_tx, width, height, sp, sorted_frames).await;
+            frame_sorting_worker(i, consumer_rx, sorter_tx, width, height, sp, sorted_frames, (args.black_threshold, args.white_threshold)).await;
         });
 
         tasks.push(st);
     }
 
     let cp = process.clone();
-    let op = String::from(output_path);
+    let op = String::from(args.args[0].clone());
     let consumer_task = tokio::spawn(async move {
-        let res = frame_encoding_worker(sorter_rx, &op, width, height, cp, sorted_frames, frame_count, tasks).await;
+        let res = frame_encoding_worker(sorter_rx, &op, width, height, cp, sorted_frames, frame_count, args.rate, tasks).await;
         if res.is_ok() {
             println!("finished encoding");
         }
@@ -277,19 +350,48 @@ async fn process_video(
     })
     .expect("Error setting Ctrl-C handler");
 
-    while !consumer_task.is_finished() {}
+    while !consumer_task.is_finished() {
+        sleep(Duration::from_millis(100)).await;
+    }
 
     Ok(())
 }
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, value_name = "FILE", help = "input file to sort", required = true)]
+    input: String,
+
+    #[arg(short, long, default_value_t = 30, help = "framerate of sorted video")]
+    rate: u16,
+
+    #[arg(short, long, default_value_t = 4, help = "number of threads to use (account for two ffmpeg instances)")]
+    threads: usize,
+
+    #[arg(short, long, default_value_t = 155, help = "white threshold max: 255")]
+    white_threshold: u8,
+
+    #[arg(short, long, default_value_t = 60, help = "black threshold min: 0")]
+    black_threshold: u8,
+
+    #[arg(name = "ARGS")]
+    args: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
-    let filename = "replay.mkv";
-    let output = "sorted.mp4";
-    let (width, height) = get_resolution(filename).await;
-    if let Ok(frame_count) = get_video_packet_count(filename).await {
+    let args = Args::parse();
+
+    let input = args.input.clone();
+    // let rate = args.rate;
+    // let threads = args.threads;
+    // let file_path = &args.args[0];
+
+    let (width, height) = get_resolution(&input).await;
+    if let Ok(frame_count) = get_video_packet_count(&input).await {
         println!("frames: {}", frame_count);
-        let status = process_video(filename, output, width, height, frame_count).await;
+        let status = process_video(width, height, frame_count, args).await;
         if status.is_err() {
             println!("oh no");
         }
