@@ -29,65 +29,84 @@ fn sort_pixels_by_luminance(
     width: usize,
     height: usize,
     threshold: (u8, u8),
+    horizontal: bool,
 ) -> Vec<u8> {
 
-    // horizontal
-    // let mut frame2d = frame
-    //     .chunks_exact(3)
-    //     .map(|chunk| (chunk[0], chunk[1], chunk[2]))
-    //     .collect::<Vec<(u8, u8, u8)>>()
-    //     .chunks(width)
-    //     .map(|chunk| chunk.to_vec())
-    //     .collect::<Vec<Vec<(u8, u8, u8)>>>();
-
-    //     for i in 0..height {
-    //         frame2d[i].sort_by(pixel_compare);
-    //     }
-
-    // let final_frame = frame2d.into_iter().flat_map(|row| row.into_iter().flat_map(|(r, g, b)| vec![r, g, b])).collect();
-
-    // vertical
-    let mut frame2d = convert_to_2d_tuples(frame, width, height);
+    let mut frame2d;
+    let mut final_frame: Vec<u8>;
 
     let black_threshold = threshold.0;
     let white_threshold = threshold.1;
 
-    for i in 0..width {
-        let mut index = 0;
-        let mut in_segment = false;
-        for j in 0..height {
-            let pixel = frame2d[i][j];
-            let luminance = ((pixel.0 as u32  + pixel.1 as u32 + pixel.2 as u32) / 3) as u8;
+    if horizontal {
+        frame2d = frame
+            .chunks_exact(3)
+            .map(|chunk| (chunk[0], chunk[1], chunk[2]))
+            .collect::<Vec<(u8, u8, u8)>>()
+            .chunks(width)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<Vec<(u8, u8, u8)>>>();
 
-            if luminance >= black_threshold && luminance <= white_threshold {
-                if !in_segment {
-                    in_segment = true;
+        for i in 0..height {
+            let mut index = 0;
+            let mut in_segment = false;
+            for j in 0..width {
+                let pixel = frame2d[i][j];
+                let luminance = ((pixel.0 as u32  + pixel.1 as u32 + pixel.2 as u32) / 3) as u8;
+
+                if luminance >= black_threshold && luminance <= white_threshold {
+                    if !in_segment {
+                        in_segment = true;
+                        index = j;
+                    } 
+                } else if in_segment {
+                    in_segment = false;
+                    let chunk = &mut frame2d[i][index..j];
+                    chunk.sort_by(pixel_compare);
                     index = j;
-                } 
-            } else if in_segment {
-                // End of the segment
-                in_segment = false;
-                let chunk = &mut frame2d[i][index..j];
-                chunk.sort_by(pixel_compare);
-                index = j;
+                }
             }
         }
 
-        if in_segment {
-            let chunk = &mut frame2d[i][index..height];
-            chunk.sort_by(pixel_compare);
+        final_frame = frame2d.into_iter().flat_map(|row| row.into_iter().flat_map(|(r, g, b)| vec![r, g, b])).collect();
+    } else {
+        frame2d = convert_to_2d_tuples(frame, width, height);
+
+        for i in 0..width {
+            let mut index = 0;
+            let mut in_segment = false;
+            for j in 0..height {
+                let pixel = frame2d[i][j];
+                let luminance = ((pixel.0 as u32  + pixel.1 as u32 + pixel.2 as u32) / 3) as u8;
+
+                if luminance >= black_threshold && luminance <= white_threshold {
+                    if !in_segment {
+                        in_segment = true;
+                        index = j;
+                    } 
+                } else if in_segment {
+                    in_segment = false;
+                    let chunk = &mut frame2d[i][index..j];
+                    chunk.sort_by(pixel_compare);
+                    index = j;
+                }
+            }
+
+            if in_segment {
+                let chunk = &mut frame2d[i][index..height];
+                chunk.sort_by(pixel_compare);
+            }
         }
-        // frame2d[i].sort_by(pixel_compare);
-    }
 
-    let mut final_frame = Vec::new();
+        final_frame = Vec::new();
 
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = frame2d[x][y];
-            final_frame.push(pixel.0);
-            final_frame.push(pixel.1);
-            final_frame.push(pixel.2);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = frame2d[x][y];
+                final_frame.push(pixel.0);
+                final_frame.push(pixel.1);
+                final_frame.push(pixel.2);
+            }
         }
     }
     final_frame
@@ -247,10 +266,11 @@ async fn frame_sorting_worker(
     process: Arc<AtomicBool>,
     sorted_frames: Arc<AtomicU16>,
     threshold: (u8, u8),
+    horizontal: bool,
 ) {
     while process.load(Ordering::SeqCst) {
         if let Ok(frame) = consumer_rx.recv() {
-            let sorted_frame = sort_pixels_by_luminance(frame.1, width, height, threshold);
+            let sorted_frame = sort_pixels_by_luminance(frame.1, width, height, threshold, horizontal);
             while sorted_frames.load(Ordering::SeqCst) != frame.0 as u16 && process.load(Ordering::SeqCst) {}
             if let Ok(_res) = sorter_tx.send((frame.0, sorted_frame)) {
                 // println!("[{}]: {}", id, frame.0);
@@ -312,7 +332,11 @@ async fn process_video(
     let (sorter_tx, sorter_rx) = bounded(num_workers);
 
     let ep = process.clone();
+    let cp = process.clone();
+    
     let fp: String = String::from(args.input);
+    let op = String::from(args.args[0].clone());
+    let rate = args.rate.clone();
     let extractor = tokio::spawn(async move {
         let res = frame_extracting_worker(producer_tx, &fp, width, height, ep).await;
         if res.is_err() {
@@ -326,19 +350,17 @@ async fn process_video(
         let consumer_rx = consumer_rx.clone();
         let sorter_tx = sorter_tx.clone();
         let sorted_frames = sorted_frames.clone();
+        let horizontal = args.horizontal;
 
         let sp = process.clone();
         let st = tokio::spawn(async move {
-            frame_sorting_worker(i, consumer_rx, sorter_tx, width, height, sp, sorted_frames, (args.black_threshold, args.white_threshold)).await;
+            frame_sorting_worker(i, consumer_rx, sorter_tx, width, height, sp, sorted_frames, (args.black_threshold, args.white_threshold), horizontal).await;
         });
 
         tasks.push(st);
     }
-
-    let cp = process.clone();
-    let op = String::from(args.args[0].clone());
     let consumer_task = tokio::spawn(async move {
-        let res = frame_encoding_worker(sorter_rx, &op, width, height, cp, sorted_frames, frame_count, args.rate, tasks).await;
+        let res = frame_encoding_worker(sorter_rx, &op, width, height, cp, sorted_frames, frame_count, rate, tasks).await;
         if res.is_ok() {
             println!("finished encoding");
         }
@@ -375,6 +397,9 @@ struct Args {
     #[arg(short, long, default_value_t = 60, help = "black threshold min: 0")]
     black_threshold: u8,
 
+    #[arg(short = 'H', long, default_value_t = false, help = "sort horizontally")]
+    horizontal: bool,
+
     #[arg(name = "ARGS")]
     args: Vec<String>,
 }
@@ -382,13 +407,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-
     let input = args.input.clone();
-    // let rate = args.rate;
-    // let threads = args.threads;
-    // let file_path = &args.args[0];
-
     let (width, height) = get_resolution(&input).await;
+
     if let Ok(frame_count) = get_video_packet_count(&input).await {
         println!("frames: {}", frame_count);
         let status = process_video(width, height, frame_count, args).await;

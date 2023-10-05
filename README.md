@@ -21,6 +21,7 @@ rate|-r|framerate for videos
 threads|-t|numbers of threads to use for sorting
 white-threshold|-w|luminance threshold for whiteness
 black-threshold|-b|luminance threshold for blackness
+horizontal|-H|sort horizontally
 
 # Examples
 `pixsort -i 'input.mp4' -r 24 -b 0 -w 255 out.mp4`
